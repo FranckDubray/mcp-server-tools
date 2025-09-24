@@ -9,7 +9,7 @@ import pkgutil
 import time
 from hashlib import sha1
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 import uvicorn
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -33,12 +33,14 @@ MCP_HOST = os.getenv('MCP_HOST', '127.0.0.1')
 MCP_PORT = int(os.getenv('MCP_PORT', '8000'))
 EXECUTE_TIMEOUT_SEC = int(os.getenv('EXECUTE_TIMEOUT_SEC', '30'))
 RELOAD_ENV = os.getenv('RELOAD', '').strip() == '1'
+AUTO_RELOAD_TOOLS = os.getenv('AUTO_RELOAD_TOOLS', '1').strip() == '1'  # New: auto-reload by default
 
 # Global registry and cache
 registry: Dict[str, Dict[str, Any]] = {}
 _tool_id_counter = 10000  # Start tool IDs at 10000
 _last_scan_time = 0
 _tools_dir_mtime = 0
+_tools_file_set: Set[str] = set()  # Track tool files for change detection
 
 app = FastAPI(
     title="MCP Server",
@@ -84,27 +86,56 @@ class ExecuteRequest(BaseModel):
         """Get tool name from either field"""
         return self.tool_reg or self.tool or ""
 
-def get_tools_dir_mtime() -> float:
-    """Get modification time of tools directory."""
+
+def get_tools_directory_info() -> Dict[str, Any]:
+    """Get comprehensive information about tools directory for change detection."""
     try:
         import add_mcp_server.tools as tools_package
         tools_path = Path(tools_package.__path__[0])
-        if tools_path.exists():
-            # Get max mtime of directory and all .py files in it
-            mtime = tools_path.stat().st_mtime
-            for py_file in tools_path.glob("*.py"):
-                mtime = max(mtime, py_file.stat().st_mtime)
-            return mtime
+        
+        if not tools_path.exists():
+            return {"mtime": 0, "file_set": set(), "file_count": 0}
+        
+        # Get all .py files in tools directory
+        tool_files = set()
+        max_mtime = tools_path.stat().st_mtime
+        
+        for py_file in tools_path.glob("*.py"):
+            if py_file.name != "__init__.py":  # Skip __init__.py
+                tool_files.add(py_file.name)
+                max_mtime = max(max_mtime, py_file.stat().st_mtime)
+        
+        return {
+            "mtime": max_mtime,
+            "file_set": tool_files,
+            "file_count": len(tool_files),
+            "directory_exists": True
+        }
     except Exception as e:
-        logger.warning(f"Could not get tools dir mtime: {e}")
-    return 0
+        logger.warning(f"Could not get tools directory info: {e}")
+        return {"mtime": 0, "file_set": set(), "file_count": 0, "directory_exists": False}
+
 
 def discover_tools():
     """Discover and register all tools dynamically using pkgutil."""
-    global registry, _last_scan_time, _tools_dir_mtime, _tool_id_counter
+    global registry, _last_scan_time, _tools_dir_mtime, _tool_id_counter, _tools_file_set
     
     _last_scan_time = time.time()
-    _tools_dir_mtime = get_tools_dir_mtime()
+    
+    # Get current tools directory info
+    tools_info = get_tools_directory_info()
+    _tools_dir_mtime = tools_info["mtime"]
+    current_file_set = tools_info["file_set"]
+    
+    # Detect changes
+    added_files = current_file_set - _tools_file_set
+    removed_files = _tools_file_set - current_file_set
+    _tools_file_set = current_file_set
+    
+    if added_files:
+        logger.info(f"🆕 New tool files detected: {added_files}")
+    if removed_files:
+        logger.info(f"🗑️ Removed tool files detected: {removed_files}")
     
     old_count = len(registry)
     registry.clear()
@@ -177,12 +208,17 @@ def discover_tools():
     new_count = len(registry)
     if new_count != old_count:
         logger.info(f"🔄 Tool count changed: {old_count} → {new_count}")
+        if new_count > old_count:
+            logger.info(f"🎉 {new_count - old_count} new tool(s) discovered!")
+        elif new_count < old_count:
+            logger.info(f"🧹 {old_count - new_count} tool(s) removed")
     
     logger.info(f"🔧 Tool discovery complete. Registered {new_count} tools: {list(registry.keys())}")
 
+
 def should_reload(request: Request) -> bool:
-    """Check if we should reload tools based on file changes or explicit request."""
-    global _last_scan_time, _tools_dir_mtime
+    """Enhanced: Check if we should reload tools based on file changes, explicit request, or auto-reload."""
+    global _last_scan_time, _tools_dir_mtime, _tools_file_set
     
     # Force reload if explicitly requested
     if RELOAD_ENV or request.query_params.get('reload') == '1':
@@ -194,13 +230,30 @@ def should_reload(request: Request) -> bool:
         logger.info("🔄 No tools registered, reloading")
         return True
     
-    # Check if tools directory has been modified
-    current_mtime = get_tools_dir_mtime()
-    if current_mtime > _tools_dir_mtime:
-        logger.info(f"🔄 Tools directory modified (mtime: {_tools_dir_mtime} → {current_mtime})")
-        return True
+    # Auto-reload if enabled (default)
+    if AUTO_RELOAD_TOOLS:
+        tools_info = get_tools_directory_info()
+        current_mtime = tools_info["mtime"]
+        current_file_set = tools_info["file_set"]
+        
+        # Check for file modifications
+        if current_mtime > _tools_dir_mtime:
+            logger.info(f"🔄 Tools directory modified (mtime: {_tools_dir_mtime} → {current_mtime})")
+            return True
+        
+        # Check for new or removed files
+        if current_file_set != _tools_file_set:
+            added = current_file_set - _tools_file_set
+            removed = _tools_file_set - current_file_set
+            if added:
+                logger.info(f"🔄 New tools detected: {added}")
+                return True
+            if removed:
+                logger.info(f"🔄 Tools removed: {removed}")
+                return True
     
     return False
+
 
 @app.options("/tools")
 async def tools_options():
@@ -208,9 +261,9 @@ async def tools_options():
 
 @app.get("/tools")
 async def get_tools(request: Request):
-    """Return list of available tools with ETag support."""
+    """Return list of available tools with ETag support and auto-reload."""
     if should_reload(request):
-        logger.info("🔄 Reloading tools...")
+        logger.info("🔄 Auto-reloading tools...")
         discover_tools()
     
     # Build response items (exclude 'func' from response)
@@ -268,6 +321,11 @@ async def debug_execute(request: Request):
 @app.post("/execute")
 async def execute_tool(request: ExecuteRequest):
     """Execute a tool with given parameters."""
+    # Auto-reload check before execution
+    if AUTO_RELOAD_TOOLS and should_reload(Request(scope={"type": "http", "method": "POST", "query_string": b""})):
+        logger.info("🔄 Auto-reloading tools before execution...")
+        discover_tools()
+    
     if len(registry) == 0:
         discover_tools()
     
@@ -334,7 +392,8 @@ async def control_dashboard():
         .loading { opacity: 0.6; pointer-events: none; }
         .enum-options { font-size: 0.75em; color: #007bff; margin-top: 2px; font-style: italic; }
         .required-mark { color: #dc3545; font-weight: bold; }
-        .reload-notice { background: #fff3cd; border-color: #ffeaa7; color: #856404; margin-bottom: 10px; padding: 8px 12px; border-radius: 4px; font-size: 0.85em; }
+        .reload-notice { background: #d1ecf1; border-color: #bee5eb; color: #0c5460; margin-bottom: 10px; padding: 8px 12px; border-radius: 4px; font-size: 0.85em; }
+        .auto-reload-status { background: #d4edda; border-color: #c3e6cb; color: #155724; margin-bottom: 10px; padding: 8px 12px; border-radius: 4px; font-size: 0.85em; }
     </style>
 </head>
 <body>
@@ -342,7 +401,8 @@ async def control_dashboard():
         <div class="header">
             <h1>🔧 MCP Server Control Panel</h1>
             <div id="status" class="status">Loading tools...</div>
-            <button onclick="reloadTools()" class="execute-btn">🔄 Reload Tools</button>
+            <div class="auto-reload-status">🔄 Auto-reload enabled - New tools detected automatically!</div>
+            <button onclick="reloadTools()" class="execute-btn">🔄 Force Reload Tools</button>
             <div class="reload-notice">💡 Form values are preserved when reloading tools</div>
         </div>
         <div id="toolGrid" class="tool-grid">
@@ -356,7 +416,7 @@ async def control_dashboard():
 
 @app.get("/control.js")
 async def control_js(request: Request):
-    """Serve the control panel JavaScript with form preservation."""
+    """Serve the control panel JavaScript with form preservation and auto-reload."""
     js = '''
 let tools = [];
 
@@ -410,7 +470,7 @@ async function loadTools(preserveValues = false) {
 }
 
 async function reloadTools() {
-    updateStatus('🔄 Reloading tools (preserving form values)...', '');
+    updateStatus('🔄 Force reloading tools (preserving form values)...', '');
     try {
         const response = await fetch('/tools?reload=1');
         if (response.ok) {
@@ -423,9 +483,9 @@ async function reloadTools() {
             // Restore form values
             if (Object.keys(formData).length > 0) {
                 setTimeout(() => restoreFormValues(formData), 100);
-                updateStatus(`✅ Reloaded ${tools.length} tools (✅ form values preserved): ${tools.map(t => t.name).join(', ')}`, 'success');
+                updateStatus(`✅ Force reloaded ${tools.length} tools (✅ form values preserved): ${tools.map(t => t.name).join(', ')}`, 'success');
             } else {
-                updateStatus(`✅ Reloaded ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`, 'success');
+                updateStatus(`✅ Force reloaded ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`, 'success');
             }
         } else {
             updateStatus(`❌ Failed to reload tools: ${response.statusText}`, 'error');
@@ -596,7 +656,34 @@ async function executeTool(toolName) {
     }
 }
 
-// Load tools on page load (no auto-reload)
+// Auto-reload tools every 5 seconds (silent check)
+setInterval(async function() {
+    try {
+        const response = await fetch('/tools', { method: 'HEAD' });
+        if (response.headers.get('ETag') !== currentETag) {
+            // ETag changed, reload tools silently
+            const formData = saveFormValues();
+            const loadResponse = await fetch('/tools');
+            if (loadResponse.ok) {
+                const newTools = await loadResponse.json();
+                if (newTools.length !== tools.length || 
+                    JSON.stringify(newTools.map(t => t.name).sort()) !== JSON.stringify(tools.map(t => t.name).sort())) {
+                    tools = newTools;
+                    renderTools();
+                    setTimeout(() => restoreFormValues(formData), 100);
+                    updateStatus(`🔄 Auto-detected ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`, 'success');
+                }
+            }
+            currentETag = response.headers.get('ETag');
+        }
+    } catch (error) {
+        // Silent fail for auto-reload
+    }
+}, 5000);
+
+let currentETag = null;
+
+// Load tools on page load with auto-reload enabled
 document.addEventListener('DOMContentLoaded', () => loadTools(false));
 '''
     return Response(
@@ -607,9 +694,13 @@ document.addEventListener('DOMContentLoaded', () => loadTools(false));
 # Initialize tools on startup
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting MCP Server with Numeric IDs...")
+    logger.info("🚀 Starting MCP Server with Auto-Reload...")
     discover_tools()
     logger.info(f"🔧 Server ready with {len(registry)} tools")
+    if AUTO_RELOAD_TOOLS:
+        logger.info("🔄 Auto-reload enabled - New tools will be detected automatically")
+    else:
+        logger.info("📌 Auto-reload disabled - Use ?reload=1 or restart server for new tools")
 
 if __name__ == "__main__":
     uvicorn.run(
