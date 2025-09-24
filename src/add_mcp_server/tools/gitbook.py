@@ -1,6 +1,6 @@
 """
 Enhanced GitBook Tool - Smart discovery and global search
-Automatically discover all pages and search across entire documentation
+Automatically find all pages and search across entire documentation
 """
 
 import requests
@@ -23,6 +23,110 @@ def clean_text(text: str) -> str:
     text = re.sub(r'Table of contents|On this page|Previous|Next', '', text, flags=re.IGNORECASE)
     
     return text
+
+
+def guess_gitbook_urls(company_name: str) -> List[str]:
+    """Generate possible GitBook URLs for a company/organization."""
+    if not company_name:
+        return []
+    
+    # Clean company name
+    name = company_name.lower().strip()
+    name = re.sub(r'[^a-z0-9-]', '', name)  # Keep only alphanumeric and hyphens
+    
+    # Generate possible URLs
+    possible_urls = [
+        f"https://{name}.gitbook.io",
+        f"https://docs.{name}.com",
+        f"https://doc.{name}.com", 
+        f"https://help.{name}.com",
+        f"https://support.{name}.com",
+        f"https://{name}.gitbook.com",
+        f"https://{name}-docs.gitbook.io",
+        f"https://{name}docs.gitbook.io"
+    ]
+    
+    return possible_urls
+
+
+def test_gitbook_url(url: str) -> Dict[str, Any]:
+    """Test if a URL is a valid GitBook documentation."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; GitBook-Discovery-Tool/1.0)',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+        
+        if response.status_code == 200:
+            # Check if it's actually GitBook
+            content = response.text.lower()
+            gitbook_indicators = [
+                'gitbook',
+                'data-testid="page-content"',
+                'gitbook.io',
+                'gitbook.com',
+                '__gitbook'
+            ]
+            
+            is_gitbook = any(indicator in content for indicator in gitbook_indicators)
+            
+            if is_gitbook:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                title = ""
+                
+                # Try to get page title
+                title_elem = soup.select_one('title')
+                if title_elem:
+                    title = clean_text(title_elem.get_text())
+                
+                return {
+                    "url": response.url,  # Final URL after redirects
+                    "status": "valid",
+                    "title": title,
+                    "is_gitbook": True
+                }
+        
+        return {
+            "url": url,
+            "status": "not_found",
+            "is_gitbook": False
+        }
+        
+    except requests.RequestException:
+        return {
+            "url": url,
+            "status": "error",
+            "is_gitbook": False
+        }
+
+
+def extract_base_url_from_page(page_url: str) -> str:
+    """Extract GitBook base URL from any page URL."""
+    if not page_url:
+        return ""
+    
+    parsed = urlparse(page_url)
+    
+    # For GitBook URLs, the base is usually just the domain
+    if 'gitbook.io' in parsed.netloc or 'gitbook.com' in parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    
+    # For custom domains, try to find the root
+    # Usually GitBook docs are at the root or /docs
+    base_candidates = [
+        f"{parsed.scheme}://{parsed.netloc}",
+        f"{parsed.scheme}://{parsed.netloc}/docs",
+    ]
+    
+    for candidate in base_candidates:
+        test_result = test_gitbook_url(candidate)
+        if test_result["is_gitbook"]:
+            return candidate
+    
+    # Fallback to domain root
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def discover_sitemap(base_url: str) -> List[str]:
@@ -244,7 +348,45 @@ def search_in_pages(pages_data: List[Dict], query: str, max_results: int = 10) -
 def run(operation: str, **params) -> Dict[str, Any]:
     """Execute GitBook operations with enhanced discovery and search."""
     
-    if operation == "discover_site":
+    if operation == "find_docs":
+        company = params.get('company')
+        
+        if not company:
+            return {"error": "company name required for find_docs operation"}
+        
+        # Generate possible URLs
+        possible_urls = guess_gitbook_urls(company)
+        
+        # Test each URL
+        found_docs = []
+        for url in possible_urls:
+            result = test_gitbook_url(url)
+            if result["is_gitbook"]:
+                found_docs.append(result)
+        
+        return {
+            "success": True,
+            "company": company,
+            "urls_tested": len(possible_urls),
+            "docs_found": len(found_docs),
+            "results": found_docs
+        }
+    
+    elif operation == "extract_base_url":
+        page_url = params.get('page_url')
+        
+        if not page_url:
+            return {"error": "page_url required for extract_base_url operation"}
+        
+        base_url = extract_base_url_from_page(page_url)
+        
+        return {
+            "success": True,
+            "original_url": page_url,
+            "base_url": base_url
+        }
+    
+    elif operation == "discover_site":
         base_url = params.get('base_url')
         
         if not base_url:
@@ -344,7 +486,7 @@ def run(operation: str, **params) -> Dict[str, Any]:
         return result
     
     else:
-        return {"error": f"Unknown operation: {operation}. Available: discover_site, search_site, read_page"}
+        return {"error": f"Unknown operation: {operation}. Available: find_docs, extract_base_url, discover_site, search_site, read_page"}
 
 
 def spec() -> Dict[str, Any]:
@@ -361,11 +503,21 @@ def spec() -> Dict[str, Any]:
                     "operation": {
                         "type": "string",
                         "enum": [
+                            "find_docs",
+                            "extract_base_url", 
                             "discover_site",
                             "search_site",
                             "read_page"
                         ],
-                        "description": "Operation: discover_site (find all pages), search_site (search across entire documentation), read_page (read specific page)"
+                        "description": "Operation: find_docs (find GitBook docs for company), extract_base_url (get base URL from page), discover_site (find all pages), search_site (search across entire documentation), read_page (read specific page)"
+                    },
+                    "company": {
+                        "type": "string",
+                        "description": "Company/organization name for find_docs operation"
+                    },
+                    "page_url": {
+                        "type": "string", 
+                        "description": "Any page URL to extract base URL from"
                     },
                     "base_url": {
                         "type": "string",
