@@ -34,7 +34,7 @@ def github_api_request(method: str, endpoint: str, data=None) -> Dict[str, Any]:
         elif method.upper() == "PUT":
             response = requests.put(url, headers=headers, json=data)
         elif method.upper() == "DELETE":
-            response = requests.delete(url, headers=headers)
+            response = requests.delete(url, headers=headers, json=data)
         else:
             return {"error": f"Unsupported method: {method}"}
         
@@ -72,6 +72,39 @@ def create_or_update_file(owner: str, repo: str, path: str, content: str, messag
         data["sha"] = get_response["sha"]
     
     return github_api_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", data)
+
+
+def delete_file_from_repo(owner: str, repo: str, path: str, message: str, branch: str = "main") -> Dict[str, Any]:
+    """Delete a file from GitHub repository via API."""
+    
+    # First, get the file to get its SHA (required for deletion)
+    get_response = github_api_request("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+    
+    if "error" in get_response:
+        return get_response
+    
+    if "sha" not in get_response:
+        return {"error": f"Could not get SHA for file {path}"}
+    
+    # Delete the file using its SHA
+    data = {
+        "message": message,
+        "sha": get_response["sha"],
+        "branch": branch
+    }
+    
+    return github_api_request("DELETE", f"/repos/{owner}/{repo}/contents/{path}", data)
+
+
+def delete_multiple_files(owner: str, repo: str, files: List[str], message: str, branch: str = "main") -> Dict[str, Any]:
+    """Delete multiple files from GitHub repository."""
+    
+    results = []
+    for file_path in files:
+        result = delete_file_from_repo(owner, repo, file_path, f"{message} - {file_path}", branch)
+        results.append({"file": file_path, "result": result})
+    
+    return {"results": results, "total": len(files), "processed": len(results)}
 
 
 def git_clone_to_clone_dir(repo_url: str, repo_name: str = None) -> Dict[str, Any]:
@@ -222,6 +255,31 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
                 results.append({"error": str(e), "file": local_path})
         
         return {"results": results, "total": len(files), "processed": len(results)}
+    
+    # === NEW: DELETE OPERATIONS ===
+    elif operation == "delete_file":
+        owner = params.get('owner')
+        repo = params.get('repo')
+        file_path = params.get('file_path')  # Path in repo to delete
+        message = params.get('message', f"Delete {file_path}")
+        branch = params.get('branch', 'main')
+        
+        if not all([owner, repo, file_path]):
+            return {"error": "owner, repo, and file_path required"}
+        
+        return delete_file_from_repo(owner, repo, file_path, message, branch)
+    
+    elif operation == "delete_multiple_files":
+        owner = params.get('owner')
+        repo = params.get('repo')
+        files = params.get('files', [])  # List of file paths to delete
+        message = params.get('message', "Delete multiple files")
+        branch = params.get('branch', 'main')
+        
+        if not all([owner, repo, files]):
+            return {"error": "owner, repo, and files list required"}
+        
+        return delete_multiple_files(owner, repo, files, message, branch)
     
     elif operation == "get_repo_contents":
         owner = params.get('owner')
@@ -387,13 +445,15 @@ def spec() -> Dict[str, Any]:
                             "create_repo", "get_user", "list_repos",
                             # File operations (API-based)
                             "add_file", "add_multiple_files", "get_repo_contents",
+                            # NEW: Delete operations
+                            "delete_file", "delete_multiple_files",
                             # Branch management
                             "create_branch", "get_commits",
                             # Legacy operations (redirected to API)
                             "clone", "status", "add", "commit", "push", "pull", 
                             "branch", "checkout", "log", "diff"
                         ],
-                        "description": "Git/GitHub operation. NEW API OPERATIONS: add_file, add_multiple_files, get_repo_contents, create_branch, get_commits. LEGACY: clone, status, add, commit, push, pull, branch, checkout, log, diff (now use API)"
+                        "description": "Git/GitHub operation. NEW: delete_file, delete_multiple_files. API OPERATIONS: add_file, add_multiple_files, get_repo_contents, create_branch, get_commits. LEGACY: clone, status, add, commit, push, pull, branch, checkout, log, diff"
                     },
                     # Repository identification
                     "owner": {
@@ -407,7 +467,7 @@ def spec() -> Dict[str, Any]:
                     # File operations
                     "file_path": {
                         "type": "string",
-                        "description": "Local file path to upload"
+                        "description": "Local file path to upload OR repository file path to delete"
                     },
                     "repo_path": {
                         "type": "string",
@@ -415,7 +475,7 @@ def spec() -> Dict[str, Any]:
                     },
                     "files": {
                         "type": "array",
-                        "description": "Array of {local_path, repo_path} objects for multiple files"
+                        "description": "Array of {local_path, repo_path} objects for multiple files OR array of file paths for deletion"
                     },
                     # Branch operations
                     "branch": {
