@@ -28,6 +28,7 @@ if [ ! -d "venv" ]; then
 fi
 
 echo -e "${YELLOW}📦 Activating virtual environment...${NC}"
+# shellcheck disable=SC1091
 source venv/bin/activate
 
 # Install/upgrade dependencies
@@ -35,24 +36,35 @@ echo -e "${YELLOW}📦 Installing dependencies...${NC}"
 pip install -q --upgrade pip
 pip install -q -e ".[dev]"
 
+# Ensure pypdf is installed (used by pdf_search/pdf2text)
+if ! python -c "import pypdf" >/dev/null 2>&1; then
+  echo -e "${YELLOW}📄 Installing pypdf (PDF support)...${NC}"
+  pip install -q pypdf>=4.2.0
+else
+  echo -e "${GREEN}📄 pypdf available${NC}"
+fi
+
 # Environment variables
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
 export MCP_PORT="${MCP_PORT:-8000}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export RELOAD="${RELOAD:-1}"
 export EXECUTE_TIMEOUT_SEC="${EXECUTE_TIMEOUT_SEC:-30}"
+export AUTO_RELOAD_TOOLS="${AUTO_RELOAD_TOOLS:-1}"  # new: auto reload tools (1=on, 0=off)
 
 echo -e "${GREEN}🌐 Server Configuration:${NC}"
 echo -e "  Host: ${MCP_HOST}"
 echo -e "  Port: ${MCP_PORT}"
 echo -e "  Log Level: ${LOG_LEVEL}"
-echo -e "  Hot Reload: ${RELOAD}"
+echo -e "  Hot Reload (legacy RELOAD): ${RELOAD}"
+echo -e "  Auto Reload Tools: ${AUTO_RELOAD_TOOLS}"
 echo -e "  Timeout: ${EXECUTE_TIMEOUT_SEC}s"
 
 echo -e "${GREEN}🔗 URLs:${NC}"
 echo -e "  API Base: http://${MCP_HOST}:${MCP_PORT}"
 echo -e "  Tools: http://${MCP_HOST}:${MCP_PORT}/tools"
 echo -e "  Control Panel: http://${MCP_HOST}:${MCP_PORT}/control"
+echo -e "  Config: http://${MCP_HOST}:${MCP_PORT}/config"
 
 echo -e "${GREEN}▶️  Starting server...${NC}"
 echo -e "${YELLOW}   Press Ctrl+C to stop${NC}"
