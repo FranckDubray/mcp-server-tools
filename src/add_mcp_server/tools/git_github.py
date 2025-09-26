@@ -58,8 +58,8 @@ def get_file_content(file_path: str) -> str:
 def create_or_update_file(owner: str, repo: str, path: str, content: str, message: str, branch: str = "main") -> Dict[str, Any]:
     """Create or update a file via GitHub API."""
     
-    # First, try to get the existing file to get its SHA
-    get_response = github_api_request("GET", f"/repos/{owner}/{repo}/contents/{path}")
+    # First, try to get the existing file to get its SHA (on the right branch)
+    get_response = github_api_request("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
     
     data = {
         "message": message,
@@ -235,24 +235,28 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         
         results = []
         for file_info in files:
-            local_path = file_info.get('local_path')
-            repo_path = file_info.get('repo_path')
-            
-            if not local_path or not repo_path:
-                results.append({"error": f"Missing local_path or repo_path in {file_info}"})
-                continue
-            
-            try:
-                content = get_file_content(local_path)
-                if content.startswith("Error reading file"):
-                    results.append({"error": content, "file": local_path})
+            # Accept either object {local_path, repo_path} or string path (ignored for add)
+            if isinstance(file_info, dict):
+                local_path = file_info.get('local_path')
+                repo_path = file_info.get('repo_path')
+                
+                if not local_path or not repo_path:
+                    results.append({"error": f"Missing local_path or repo_path in {file_info}"})
                     continue
                 
-                result = create_or_update_file(owner, repo, repo_path, content, f"{message} - {repo_path}", branch)
-                results.append({"file": repo_path, "result": result})
-                
-            except Exception as e:
-                results.append({"error": str(e), "file": local_path})
+                try:
+                    content = get_file_content(local_path)
+                    if content.startswith("Error reading file"):
+                        results.append({"error": content, "file": local_path})
+                        continue
+                    
+                    result = create_or_update_file(owner, repo, repo_path, content, f"{message} - {repo_path}", branch)
+                    results.append({"file": repo_path, "result": result})
+                    
+                except Exception as e:
+                    results.append({"error": str(e), "file": local_path})
+            else:
+                results.append({"skip": True, "reason": "Non-object entry in files; expected {local_path, repo_path}"})
         
         return {"results": results, "total": len(files), "processed": len(results)}
     
@@ -279,12 +283,23 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         if not all([owner, repo, files]):
             return {"error": "owner, repo, and files list required"}
         
-        return delete_multiple_files(owner, repo, files, message, branch)
+        # Accept both list[str] and list[object with repo_path]
+        normalized_files: List[str] = []
+        for entry in files:
+            if isinstance(entry, str):
+                normalized_files.append(entry)
+            elif isinstance(entry, dict) and 'repo_path' in entry:
+                normalized_files.append(entry['repo_path'])
+            else:
+                return {"error": f"Invalid files entry: {entry}. Use string repo paths or objects with repo_path."}
+        
+        return delete_multiple_files(owner, repo, normalized_files, message, branch)
     
     elif operation == "get_repo_contents":
         owner = params.get('owner')
         repo = params.get('repo')
         path = params.get('path', '')
+        branch = params.get('branch')
         
         if not all([owner, repo]):
             return {"error": "owner and repo required"}
@@ -292,6 +307,8 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         endpoint = f"/repos/{owner}/{repo}/contents"
         if path:
             endpoint += f"/{path}"
+        if branch:
+            endpoint += f"?ref={branch}"
             
         return github_api_request("GET", endpoint)
     
@@ -434,7 +451,7 @@ def spec() -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": "git_github",
-            "description": "Complete Git + GitHub tool using pure API calls. No CLI dependency! Requires GITHUB_TOKEN.",
+            "description": "Gestion complète GitHub via API (création de repo, fichiers, branches, commits, diff). Aucune dépendance CLI. Nécessite GITHUB_TOKEN.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -453,90 +470,106 @@ def spec() -> Dict[str, Any]:
                             "clone", "status", "add", "commit", "push", "pull", 
                             "branch", "checkout", "log", "diff"
                         ],
-                        "description": "Git/GitHub operation. NEW: delete_file, delete_multiple_files. API OPERATIONS: add_file, add_multiple_files, get_repo_contents, create_branch, get_commits. LEGACY: clone, status, add, commit, push, pull, branch, checkout, log, diff"
+                        "description": "Type d'opération à exécuter. Fichiers: add_file/add_multiple_files/delete_file/delete_multiple_files. Branches: create_branch. Repo: create_repo/list_repos/get_user. Autres: get_commits/get_repo_contents/diff/clone/status/log."
                     },
                     # Repository identification
                     "owner": {
                         "type": "string",
-                        "description": "Repository owner (username or org)"
+                        "description": "Propriétaire du dépôt (utilisateur ou organisation)"
                     },
                     "repo": {
                         "type": "string", 
-                        "description": "Repository name"
+                        "description": "Nom du dépôt GitHub"
                     },
                     # File operations
                     "file_path": {
                         "type": "string",
-                        "description": "Local file path to upload OR repository file path to delete"
+                        "description": "Chemin de fichier local à téléverser (add_file) OU chemin dans le dépôt à supprimer (delete_file)"
                     },
                     "repo_path": {
                         "type": "string",
-                        "description": "Path in repository where to store the file"
+                        "description": "Chemin de destination dans le dépôt pour stocker le fichier (add_file)"
                     },
                     "files": {
                         "type": "array",
-                        "description": "Array of {local_path, repo_path} objects for multiple files OR array of file paths for deletion"
+                        "description": "Pour add_multiple_files: tableau d'objets {local_path, repo_path}. Pour delete_multiple_files: tableau de chaînes (chemins dans le dépôt) ou d'objets {repo_path}.",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string", "description": "Chemin de fichier dans le dépôt (suppression)" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "local_path": { "type": "string", "description": "Chemin local du fichier à téléverser" },
+                                        "repo_path": { "type": "string", "description": "Chemin de destination dans le dépôt" }
+                                    },
+                                    "required": ["repo_path"],
+                                    "additionalProperties": False
+                                }
+                            ]
+                        }
                     },
                     # Branch operations
                     "branch": {
                         "type": "string",
-                        "description": "Branch name (default: main)"
+                        "description": "Nom de branche (par défaut: main)"
                     },
                     "branch_name": {
                         "type": "string",
-                        "description": "New branch name to create"
+                        "description": "Nom de la nouvelle branche à créer"
                     },
                     "from_branch": {
                         "type": "string",
-                        "description": "Source branch for new branch (default: main)"
+                        "description": "Branche source pour créer la nouvelle branche (défaut: main)"
                     },
                     # Commit operations
                     "message": {
                         "type": "string",
-                        "description": "Commit message"
+                        "description": "Message de commit pour les opérations de fichiers"
                     },
                     "count": {
-                        "type": "number",
-                        "description": "Number of commits to retrieve (default: 5)"
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Nombre de commits à récupérer (défaut: 5)"
                     },
                     # Clone operations
                     "repo_url": {
                         "type": "string",
-                        "description": "Repository URL for cloning (e.g., https://github.com/user/repo.git)"
+                        "description": "URL du dépôt à cloner (ex: https://github.com/user/repo.git)"
                     },
                     "remote": {
                         "type": "string",
-                        "description": "[LEGACY] Git remote name - API operations don't need this"
+                        "description": "[HÉRITÉ] Nom du remote Git (inutile en mode API)"
                     },
                     # Repository creation
                     "name": {
                         "type": "string",
-                        "description": "Repository name for creation OR custom directory name for clone"
+                        "description": "Nom du dépôt à créer OU nom de dossier cible pour clone"
                     },
                     "description": {
                         "type": "string",
-                        "description": "Repository description"
+                        "description": "Description du dépôt lors de la création"
                     },
                     "private": {
                         "type": "boolean",
-                        "description": "Make repository private (default: false)"
+                        "description": "Créer le dépôt en privé (défaut: false)"
                     },
                     "username": {
                         "type": "string",
-                        "description": "GitHub username for user operations"
+                        "description": "Nom d'utilisateur GitHub pour les opérations utilisateur"
                     },
                     # Diff operations
                     "base": {
                         "type": "string",
-                        "description": "Base branch for diff (default: main)"
+                        "description": "Branche de base pour le diff (défaut: main)"
                     },
                     "head": {
                         "type": "string",
-                        "description": "Head branch for diff"
+                        "description": "Branche de comparaison (HEAD) pour le diff"
                     },
+                    # Contents operations
                     "path": {
                         "type": "string",
-                        "description": "Path in repository for content operations"
+                        "description": "Chemin dans le dépôt pour lister/obtenir le contenu"
                     }
                 },
                 "required": ["operation"],
