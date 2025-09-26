@@ -21,14 +21,16 @@ def github_api_request(method: str, endpoint: str, data=None) -> Dict[str, Any]:
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
-        "User-Agent": "MCP-Git-GitHub-Tool/2.0"
+        "User-Agent": "MCP-Git-GitHub-Tool/2.1"
     }
     
     url = f"https://api.github.com{endpoint}"
     
     try:
         if method.upper() == "GET":
-            response = requests.get(url, headers=headers)
+            # Allow passing query params via 'data' when it's a dict
+            params = data if isinstance(data, dict) else None
+            response = requests.get(url, headers=headers, params=params)
         elif method.upper() == "POST":
             response = requests.post(url, headers=headers, json=data)
         elif method.upper() == "PUT":
@@ -40,6 +42,9 @@ def github_api_request(method: str, endpoint: str, data=None) -> Dict[str, Any]:
         
         if response.status_code >= 400:
             return {"error": f"GitHub API error {response.status_code}: {response.text}"}
+        
+        if response.status_code == 204:
+            return {"success": True, "status": 204}
         
         return response.json() if response.content else {"success": True}
     except Exception as e:
@@ -68,7 +73,7 @@ def create_or_update_file(owner: str, repo: str, path: str, content: str, messag
     }
     
     # If file exists, we need the SHA for update
-    if "sha" in get_response:
+    if isinstance(get_response, dict) and "sha" in get_response:
         data["sha"] = get_response["sha"]
     
     return github_api_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", data)
@@ -200,6 +205,25 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         else:
             # List user's own repos
             return github_api_request("GET", "/user/repos")
+
+    elif operation == "list_branches":
+        owner = params.get('owner')
+        repo = params.get('repo')
+        per_page = params.get('per_page', 100)
+        if not all([owner, repo]):
+            return {"error": "owner and repo required"}
+        return github_api_request("GET", f"/repos/{owner}/{repo}/branches", {"per_page": per_page})
+
+    elif operation == "merge_branch":
+        owner = params.get('owner')
+        repo = params.get('repo')
+        base = params.get('base', 'main')
+        head = params.get('head')
+        commit_message = params.get('message', f"Merge {head} into {base}")
+        if not all([owner, repo, head]):
+            return {"error": "owner, repo and head required"}
+        data = {"base": base, "head": head, "commit_message": commit_message}
+        return github_api_request("POST", f"/repos/{owner}/{repo}/merges", data)
     
     # === FILE OPERATIONS VIA API ===
     elif operation == "add_file":
@@ -209,24 +233,27 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         repo_path = params.get('repo_path')  # Path in repo
         message = params.get('message', f"Add {repo_path}")
         branch = params.get('branch', 'main')
+        inline_content = params.get('content')
         
-        if not all([owner, repo, file_path, repo_path]):
-            return {"error": "owner, repo, file_path, and repo_path required"}
+        if not all([owner, repo, repo_path]):
+            return {"error": "owner, repo, and repo_path required"}
         
-        # Read local file content
-        try:
+        # Determine content source: inline content first, else local file path
+        if inline_content is not None:
+            content = inline_content
+        else:
+            if not file_path:
+                return {"error": "file_path or content required"}
             content = get_file_content(file_path)
             if content.startswith("Error reading file"):
                 return {"error": content}
-        except Exception as e:
-            return {"error": f"Failed to read file {file_path}: {e}"}
         
         return create_or_update_file(owner, repo, repo_path, content, message, branch)
     
     elif operation == "add_multiple_files":
         owner = params.get('owner')
         repo = params.get('repo')
-        files = params.get('files', [])  # List of {local_path, repo_path}
+        files = params.get('files', [])  # List of {local_path, repo_path} or {content, repo_path}
         message = params.get('message', "Add multiple files")
         branch = params.get('branch', 'main')
         
@@ -235,28 +262,35 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
         
         results = []
         for file_info in files:
-            # Accept either object {local_path, repo_path} or string path (ignored for add)
+            # Accept object {local_path, repo_path} or {content, repo_path}
             if isinstance(file_info, dict):
-                local_path = file_info.get('local_path')
                 repo_path = file_info.get('repo_path')
+                local_path = file_info.get('local_path')
+                inline_content = file_info.get('content')
                 
-                if not local_path or not repo_path:
-                    results.append({"error": f"Missing local_path or repo_path in {file_info}"})
+                if not repo_path:
+                    results.append({"error": f"Missing repo_path in {file_info}"})
                     continue
                 
                 try:
-                    content = get_file_content(local_path)
-                    if content.startswith("Error reading file"):
-                        results.append({"error": content, "file": local_path})
+                    if inline_content is not None:
+                        content = inline_content
+                    elif local_path:
+                        content = get_file_content(local_path)
+                        if content.startswith("Error reading file"):
+                            results.append({"error": content, "file": local_path})
+                            continue
+                    else:
+                        results.append({"error": f"Missing content or local_path for repo_path {repo_path}"})
                         continue
                     
                     result = create_or_update_file(owner, repo, repo_path, content, f"{message} - {repo_path}", branch)
                     results.append({"file": repo_path, "result": result})
                     
                 except Exception as e:
-                    results.append({"error": str(e), "file": local_path})
+                    results.append({"error": str(e), "file": repo_path})
             else:
-                results.append({"skip": True, "reason": "Non-object entry in files; expected {local_path, repo_path}"})
+                results.append({"skip": True, "reason": "Non-object entry in files; expected {local_path|content, repo_path}"})
         
         return {"results": results, "total": len(files), "processed": len(results)}
     
@@ -353,7 +387,7 @@ def run(operation: str, **params) -> Union[Dict[str, Any], str]:
                               headers={
                                   "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
                                   "Accept": "application/vnd.github+json",
-                                  "User-Agent": "MCP-Git-GitHub-Tool/2.0"
+                                  "User-Agent": "MCP-Git-GitHub-Tool/2.1"
                               })
         
         if response.status_code >= 400:
@@ -451,7 +485,7 @@ def spec() -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": "git_github",
-            "description": "Gestion complète GitHub via API (création de repo, fichiers, branches, commits, diff). Aucune dépendance CLI. Nécessite GITHUB_TOKEN.",
+            "description": "Gestion complète GitHub via API: dépôts, fichiers (contenu inline ou chemins locaux), branches (création, liste, merge), commits, diff, et clone. Nécessite GITHUB_TOKEN (le clone utilise git local).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -460,17 +494,19 @@ def spec() -> Dict[str, Any]:
                         "enum": [
                             # Repository management
                             "create_repo", "get_user", "list_repos",
+                            # Branches
+                            "list_branches", "create_branch", "merge_branch",
                             # File operations (API-based)
                             "add_file", "add_multiple_files", "get_repo_contents",
-                            # NEW: Delete operations
+                            # Delete operations
                             "delete_file", "delete_multiple_files",
-                            # Branch management
-                            "create_branch", "get_commits",
+                            # Commits & diff
+                            "get_commits", "diff",
                             # Legacy operations (redirected to API)
                             "clone", "status", "add", "commit", "push", "pull", 
-                            "branch", "checkout", "log", "diff"
+                            "branch", "checkout", "log"
                         ],
-                        "description": "Type d'opération à exécuter. Fichiers: add_file/add_multiple_files/delete_file/delete_multiple_files. Branches: create_branch. Repo: create_repo/list_repos/get_user. Autres: get_commits/get_repo_contents/diff/clone/status/log."
+                        "description": "Type d'opération. Fichiers: add_file/add_multiple_files (supporte 'content' inline)/delete_file/delete_multiple_files. Branches: list_branches/create_branch/merge_branch. Repo: create_repo/list_repos/get_user. Autres: get_commits/get_repo_contents/diff/clone/status/log."
                     },
                     # Repository identification
                     "owner": {
@@ -484,15 +520,19 @@ def spec() -> Dict[str, Any]:
                     # File operations
                     "file_path": {
                         "type": "string",
-                        "description": "Chemin de fichier local à téléverser (add_file) OU chemin dans le dépôt à supprimer (delete_file)"
+                        "description": "Chemin local du fichier à téléverser (add_file). Alternative à 'content'"
                     },
                     "repo_path": {
                         "type": "string",
                         "description": "Chemin de destination dans le dépôt pour stocker le fichier (add_file)"
                     },
+                    "content": {
+                        "type": "string",
+                        "description": "Contenu du fichier à téléverser (prioritaire sur file_path). Utiliser pour injecter directement le contenu."
+                    },
                     "files": {
                         "type": "array",
-                        "description": "Pour add_multiple_files: tableau d'objets {local_path, repo_path}. Pour delete_multiple_files: tableau de chaînes (chemins dans le dépôt) ou d'objets {repo_path}.",
+                        "description": "Pour add_multiple_files: tableau d'objets {repo_path, local_path? | content?}. Pour delete_multiple_files: tableau de chaînes (chemins dans le dépôt) ou d'objets {repo_path}.",
                         "items": {
                             "oneOf": [
                                 { "type": "string", "description": "Chemin de fichier dans le dépôt (suppression)" },
@@ -500,7 +540,8 @@ def spec() -> Dict[str, Any]:
                                     "type": "object",
                                     "properties": {
                                         "local_path": { "type": "string", "description": "Chemin local du fichier à téléverser" },
-                                        "repo_path": { "type": "string", "description": "Chemin de destination dans le dépôt" }
+                                        "repo_path": { "type": "string", "description": "Chemin de destination dans le dépôt" },
+                                        "content": { "type": "string", "description": "Contenu inline du fichier à téléverser (si fourni, local_path est ignoré)" }
                                     },
                                     "required": ["repo_path"],
                                     "additionalProperties": False
@@ -521,10 +562,22 @@ def spec() -> Dict[str, Any]:
                         "type": "string",
                         "description": "Branche source pour créer la nouvelle branche (défaut: main)"
                     },
+                    "base": {
+                        "type": "string",
+                        "description": "Branche de base (merge/diff), défaut: main"
+                    },
+                    "head": {
+                        "type": "string",
+                        "description": "Branche source à comparer/merger (ex: feat/xyz)"
+                    },
+                    "per_page": {
+                        "type": "integer",
+                        "description": "Pagination pour list_branches (défaut: 100)"
+                    },
                     # Commit operations
                     "message": {
                         "type": "string",
-                        "description": "Message de commit pour les opérations de fichiers"
+                        "description": "Message de commit pour les opérations de fichiers ou de merge"
                     },
                     "count": {
                         "type": "integer",
